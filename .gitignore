@@ -2,9 +2,14 @@
 __pycache__/
 *.py[codz]
 *$py.class
+*.pyo
+*.pyd
 
 # C extensions
 *.so
+
+# macOS
+.DS_Store
 
 # Distribution / packaging
 .Python
@@ -28,7 +33,7 @@ MANIFEST
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+#  before PyInstaller builds exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
 
@@ -120,8 +125,8 @@ ipython_config.py
 # pixi
 #   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
 #pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
+#   Pixi creates a virtual environment in .pixi directory, just like venv module creates one
+#   in .venv directory. It is recommended not to include this directory in version control.
 .pixi
 
 # PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
@@ -205,3 +210,12 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Project specific
+outputs/
+wandb/
+checkpoints/
+data/huggingface/
+preprocessed_data/
+
+.sisyphus/

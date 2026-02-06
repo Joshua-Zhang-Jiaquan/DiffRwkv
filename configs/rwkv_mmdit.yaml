@@ -1,0 +1,136 @@
+# RWKV-7 2.9B denoiser config (BlinkDL/rwkv7-g1)
+
+data:
+  use_preprocessed: true
+  # Point these to your pre-tokenized RWKV inputs and matched latents
+  token_dir: "preprocessed_data/rwkv_tokens/train"
+  latent_dir: "preprocessed_data/qwen_32d/latents/train"
+  max_length: 512
+  num_workers: 4
+  max_samples: null
+  # Data mode: true = use external precomputed latents, false = generate latents via Stage II
+  use_external_latents: true
+
+model:
+  type: "rwkv_diffusion_rnn"
+  diffusion_process: "mdlm"
+  latent_diffusion_process: "continuous"
+
+  # RWKV loader
+  rwkv_name: "BlinkDL/rwkv7-g1"
+  rwkv_revision: null  # Recommended: pin a commit hash/tag when using trust_remote_code
+  rwkv_local_path: null
+  rwkv_trust_remote_code: false
+  add_mask_token: true
+  pad_token_strategy: "eos"
+
+  # Freezing policy
+  freeze_backbone: true
+  train_lm_head: false
+
+  # Wrapper settings
+  use_rwkv_lm_head: false
+  latent_prefix_len: 1
+  time_conditioning: "film"  # "film" or "add"
+  dropout: 0.0
+
+  # Latent settings
+  latent_dim: 32
+  latent_timesteps: 1000
+  latent_beta_schedule: "cosine"
+  latent_parameterization: "epsilon"
+
+  # Latent prediction conditioning for T2L
+  # Controls how latent prediction is computed from text/latent context
+  # Options: "text" (use text tokens only), "prefix" (use latent prefix only), "both" (fuse both)
+  latent_pred_from: "prefix"
+
+  # Latent encoder for Stage II variational inference
+  # Options: "none" (no encoder), "mlp" (simple MLP), "rwkv_pool" (pool from RWKV hidden states)
+  latent_encoder_type: "mlp"
+
+  # Latent prior for Stage II variational inference
+  # Options: "fixed_gaussian" (fixed N(0,I)), "learned_gaussian" (learned mean/variance)
+  latent_prior_type: "fixed_gaussian"
+
+  # These are inferred from RWKV weights if null
+  hidden_size: null
+  n_blocks: null
+  n_heads: null
+  max_seq_len: 512
+
+  # Text diffusion
+  p_uniform: 0.0
+  t_eps: 1e-4
+  cluster_size: 0
+
+training:
+  seed: 42
+  num_epochs: 10
+  num_train_steps: null  # computed as num_epochs * len(train_dl) if null
+  train_batch_size: 4
+  eval_batch_size: 4
+  dtype: bf16
+  compile_model: false
+  lr_schedule: cosine
+  warmup_steps: 1000
+  resume: null
+  world_size: 1
+  ddp_find_unused_parameters: false
+  save_every_n_steps: 2000
+
+  sequential_schedule:
+    - type: "stage1_coupling"
+      steps: 2000
+    - type: "l2t"
+      steps: 4000
+    - type: "t2l"
+      steps: 4000
+
+  mode_weights: [1.0, 1.0, 1.0]
+
+  # Partial fine-tuning policy
+  # After how many steps to unfreeze additional parameters (null = never)
+  unfreeze_after_steps: null
+  # Parameter name patterns (substrings or regex) to match for unfreezing
+  unfreeze_patterns: []
+
+loss:
+  loss_type: "sequential"
+  loss_scale: 1.0
+  reduction: tokenmean
+  latent_loss_weight: 1.0
+  text_loss_weight: 1.0
+  # KL weight for Stage II variational inference
+  kl_weight: 0.01
+  # Geometry regularization weight (0 = disabled)
+  geom_weight: 0.0
+
+logging:
+  run_name: "rwkv-denoiser"
+  wandb_project: "mmdit"
+  wandb_entity: null
+  wandb_dir: "./outputs/"
+  log_freq: 100
+  eval_freq: 1000
+  save_freq: 2000
+  num_eval_batches: 25
+  save_dir: "./outputs"
+
+optimizer:
+  name: "adamw"
+  lr: 1e-4
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1e-8
+  grad_clip_norm: 1.0
+
+tokenizer:
+  cache_dir: "./data/huggingface"
+  local_files_only: true
+
+# Keep relative paths stable (do not `chdir` into the hydra run dir).
+hydra:
+  job:
+    chdir: false

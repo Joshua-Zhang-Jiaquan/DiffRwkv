@@ -1,0 +1,462 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DiRReport version="1.0">
+  <Meta>
+    <Title>DiR: Diffusion RWKV – Feasibility Analysis and Architecture Design</Title>
+    <GeneratedOn>2026-01-25</GeneratedOn>
+    <ExportNote><![CDATA[This XML is an export of a chat-authored technical report. Inline citations (if any) are not guaranteed to be authoritative; verify against primary sources/papers/repo code before implementation.]]></ExportNote>
+    <Tags>
+      <Tag>Diffusion Language Models</Tag>
+      <Tag>RWKV-v7</Tag>
+      <Tag>MM-DiT</Tag>
+      <Tag>Long-context Efficiency</Tag>
+    </Tags>
+  </Meta>
+  <Document>
+    <TopLevelHeading>DiR: Diffusion RWKV</TopLevelHeading>
+    <FullReportMarkdown>
+      <![CDATA[# DiR: Diffusion RWKV – Feasibility Analysis and Architecture Design
+
+## 1. Architecture Adaptation & Causality Conflict
+
+**Core conflict.** Diffusion language models require *bidirectional* (non-causal) context for denoising (each position benefits from both left and right context), while RWKV-v7 is pre-trained as a strictly *causal* (autoregressive) model. A naïve replacement of a bidirectional Transformer denoiser with a causal RWKV therefore risks degrading denoising quality unless we provide additional mechanisms for right-context utilization.
+
+### Option A — Pure causal RWKV (Autoregressive Diffusion)
+
+Keep RWKV strictly causal during diffusion: token position \(i\) is denoised using only left context. This preserves weight reuse and implementation simplicity, but likely weakens denoising because the model cannot exploit right-context evidence. Practically, quality may drop or require more diffusion steps \(T\), reducing end-to-end speed gains.
+
+### Option B — Bi-RWKV (two-stream forward/backward)
+
+Construct a bidirectional RWKV via two streams:
+
+- Forward stream (left-to-right): hidden \(h_i^{(f)}\)
+- Backward stream (right-to-left): hidden \(h_i^{(b)}\)
+
+Fusion choices:
+
+1) **Concatenate + linear projection**
+\[
+h_i = W \,[h_i^{(f)};h_i^{(b)}]
+\]
+
+2) **Additive fusion**
+\[
+h_i = W_f h_i^{(f)} + W_b h_i^{(b)}
+\]
+
+3) **Learned gate**
+\[
+g_i=\sigma(W_g [h_i^{(f)};h_i^{(b)}]),\quad
+h_i = g_i\odot h_i^{(f)} + (1-g_i)\odot h_i^{(b)}
+\]
+
+Pretraining reuse:
+
+- Initialize forward stream with pretrained AR RWKV weights.
+- Initialize backward stream as a copy (approx) or train briefly on reversed sequences.
+
+Trade-offs: stronger denoising (full context) but higher complexity (two passes or doubled parameters) and non-trivial training stability.
+
+### Option C — Masked / Block-causal diffusion (recommended starting point)
+
+Use block structure of size \(B\). Inside each block: allow bidirectional information; across blocks: maintain left-to-right causality.
+
+Transformer analog: block-diagonal attention mask with causal block order.
+
+RWKV analog: process blocks with limited bidirectionality (e.g., within-block forward/backward pass or intra-block mixing), and pass only the left-to-right summary state across blocks. This offers a tunable trade-off: as \(B\) increases, denoising improves but cost rises.
+
+**Key hypothesis:** Block-causal diffusion can recover much of the quality of full bidirectional denoising while keeping compute near-linear and preserving much of AR pretraining structure.
+
+#### Sketch pseudocode (block-causal, two-pass within block)
+
+```python
+def denoise_block(x_block, t_emb, rwkv_f, rwkv_b, fuse):
+    h_f = rwkv_f.forward(x_block, t_emb)         # left->right inside block
+    h_b = rwkv_b.forward(reverse(x_block), t_emb) # right->left inside block
+    h_b = reverse(h_b)
+    return fuse(h_f, h_b)                         # concat/add/gated fusion
+```
+
+## 2. Timestep Injection / Conditioning
+
+DiT commonly injects timestep (and label) through AdaLN-Zero: normalize then modulate via scale/shift predicted from \(t\) embedding.
+
+RWKV-v7 differs from Transformer: it uses TimeMix + ChannelMix and token shift operations. We propose **AdaLN-style conditioning at the LayerNorm inputs** of both TimeMix and ChannelMix, keeping core recurrence intact.
+
+### Conditioning module
+
+Let \(e_t\) be a timestep embedding (sinusoidal or learned). For each block \(l\), use an MLP to output:
+\[
+(\gamma_{\text{time}}^{(l)}(t),\beta_{\text{time}}^{(l)}(t),\gamma_{\text{ch}}^{(l)}(t),\beta_{\text{ch}}^{(l)}(t))
+\]
+
+AdaLN transform:
+\[
+\mathrm{AdaLN}(x;t)= (1+\gamma(t))\odot \mathrm{LN}(x)+\beta(t)
+\]
+
+Initialize MLP to output \(\gamma=\mathbf{0}\), \(\beta=\mathbf{0}\) (AdaLN-Zero), so conditioning starts as a no-op.
+
+### Modified RWKV block (high-level equations)
+
+For block \(l\):
+
+1) TimeMix path
+\[
+\tilde{x} = \mathrm{AdaLN}_{\text{time}}(x;t)
+\]
+\[
+y = \mathrm{TimeMix}(\tilde{x}, \text{state})
+\]
+\[
+x \leftarrow x + y
+\]
+
+2) ChannelMix path
+\[
+\tilde{x}' = \mathrm{AdaLN}_{\text{ch}}(x;t)
+\]
+\[
+y' = \mathrm{ChannelMix}(\tilde{x}')
+\]
+\[
+x \leftarrow x + y'
+\]
+
+Pseudo-code:
+
+```python
+def DiR_block(x, state, t_emb, MLP_cond, TimeMix, ChannelMix, LN):
+    gamma_t, beta_t, gamma_c, beta_c = MLP_cond(t_emb)
+    x1 = LN(x) * (1 + gamma_t) + beta_t
+    y, state = TimeMix(x1, state)
+    x = x + y
+    x2 = LN(x) * (1 + gamma_c) + beta_c
+    y2 = ChannelMix(x2)
+    x = x + y2
+    return x, state
+```
+
+**Why LN injection first?** It is minimally invasive, preserves pretrained linear projections and recurrence, and mirrors proven DiT conditioning design.
+
+## 3. Initialization from Pretrained AR RWKV-v7
+
+Goal: reuse pretrained RWKV-v7 weights to accelerate convergence and preserve language competence.
+
+### Input representation shift: tokens → noisy latents / noisy embeddings
+
+Recommended baseline: diffuse in **embedding space** (dimension \(D\)):
+
+- Clean latent \(X_0 = E(\text{tokens}) \in \mathbb{R}^{N\times D}\)
+- Noised latent:
+\[
+X_t = \sqrt{\bar{\alpha}_t}X_0 + \sqrt{1-\bar{\alpha}_t}\,\epsilon,\quad \epsilon\sim \mathcal{N}(0,I)
+\]
+
+Then RWKV consumes \(X_t\) directly (same dimensionality as embeddings), allowing reuse of most of the network unchanged.
+
+If instead using a learned continuous latent (e.g., via an encoder), initialize the first projection to approximate identity into RWKV dimension \(D\).
+
+### Output head shift: next-token logits → noise / clean latent
+
+Two common parameterizations:
+
+1) **\(\epsilon\)-prediction**: model outputs \(\hat{\epsilon}\in\mathbb{R}^{N\times D}\)
+2) **\(x_0\)-prediction**: model outputs \(\hat{X}_0\in\mathbb{R}^{N\times D}\)
+
+Implementation choices:
+
+- Keep a linear head \(W_{\text{out}}: \mathbb{R}^D\to \mathbb{R}^D\), initialized as identity (or small init), to predict \(\epsilon\) or \(x_0\).
+- Optionally keep token logits head tied to embeddings \(E^\top\) for final discretization / auxiliary loss.
+
+### Handling distribution shift in intermediate layers
+
+Even with embedding diffusion, intermediate activations will see corrupted inputs, unlike AR pretraining. Recommended strategies:
+
+- **AdaLN-Zero conditioning** to stabilize early training.
+- **Noise curriculum**: start with lower noise levels and expand.
+- **Gradual unfreezing**: initially train conditioning + top layers, then unfreeze deeper layers.
+
+ControlNet-style side branch is generally less attractive for this use-case because the denoising task differs fundamentally from AR next-token prediction; a side branch would have to learn most of the transformation anyway. Baseline recommendation: **full fine-tuning** with careful stabilization tricks.
+
+## 4. Training Objective & Loss
+
+### Latent choice
+
+For text, discrete diffusion exists, but for DiR with pretrained RWKV, **continuous Gaussian diffusion in embedding space** is the most compatible starting point.
+
+### Loss (standard diffusion MSE)
+
+Let \(\epsilon_\theta(\cdot)\) be the denoiser (DiR). Optimize:
+\[
+\mathcal{L}(\theta)=\mathbb{E}_{X_0,t,\epsilon}\Big[\|\epsilon_\theta(X_t,t)-\epsilon\|_2^2\Big]
+\]
+
+Alternative:
+\[
+\mathcal{L}(\theta)=\mathbb{E}\Big[\|\hat{X}_0(X_t,t)-X_0\|_2^2\Big]
+\]
+with appropriate weighting.
+
+Optional auxiliary token alignment term (to prevent embedding drift):
+\[
+\mathcal{L}_{\text{tok}}=-\sum_{i}\log \mathrm{Softmax}(E^\top \hat{x}_{0,i})[w_i]
+\]
+Use small weight to avoid destabilizing diffusion training.
+
+### Sampling and decoding
+
+After iterative denoising to obtain \(\hat{X}_0\), discretize each position by nearest neighbor in embedding space:
+\[
+\hat{w}_i = \arg\max_{v\in \mathcal{V}} \langle E(v),\hat{x}_{0,i}\rangle
+\]
+
+## FLOPs: Transformer vs RWKV in Diffusion
+
+Let sequence length be \(N\), model width \(D\), layers \(L\), diffusion steps \(T\).
+
+- Transformer denoiser (full attention): per step \(O(L N^2 D)\) ⇒ total \(O(T L N^2 D)\)
+- RWKV denoiser: per step \(O(L N D)\) ⇒ total \(O(T L N D)\)
+
+Thus, asymptotically, DiR yields an \(O(N)\) vs \(O(N^2)\) advantage per diffusion step, which becomes decisive for long contexts.
+
+## Biggest Potential Pitfalls
+
+1) **Causality mismatch**: insufficient right-context can degrade denoising (Option A risk), while full Bi-RWKV adds complexity/stability risk (Option B).
+2) **Training instability under heavy noise**: pretrained dynamics may not tolerate early high-noise; needs curriculum, LR control, clipping.
+3) **Embedding manifold drift**: continuous outputs may not align to actual tokens; may need auxiliary token alignment or decoding regularization.
+4) **Quality vs step count**: diffusion needs multiple steps; speed gain may diminish if large \(T\) is needed for quality.
+5) **Long-range dependency retention**: RWKV’s decay / memory behavior may underperform full attention on some global consistency tasks; may require tuning decays or block size \(B\).]]>
+    </FullReportMarkdown>
+    <Sections>
+      <Section id="1">
+        <Title>1. Architecture Adaptation &amp; Causality Conflict</Title>
+        <Content>
+          <![CDATA[**Core conflict.** Diffusion language models require *bidirectional* (non-causal) context for denoising (each position benefits from both left and right context), while RWKV-v7 is pre-trained as a strictly *causal* (autoregressive) model. A naïve replacement of a bidirectional Transformer denoiser with a causal RWKV therefore risks degrading denoising quality unless we provide additional mechanisms for right-context utilization.
+
+### Option A — Pure causal RWKV (Autoregressive Diffusion)
+
+Keep RWKV strictly causal during diffusion: token position \(i\) is denoised using only left context. This preserves weight reuse and implementation simplicity, but likely weakens denoising because the model cannot exploit right-context evidence. Practically, quality may drop or require more diffusion steps \(T\), reducing end-to-end speed gains.
+
+### Option B — Bi-RWKV (two-stream forward/backward)
+
+Construct a bidirectional RWKV via two streams:
+
+- Forward stream (left-to-right): hidden \(h_i^{(f)}\)
+- Backward stream (right-to-left): hidden \(h_i^{(b)}\)
+
+Fusion choices:
+
+1) **Concatenate + linear projection**
+\[
+h_i = W \,[h_i^{(f)};h_i^{(b)}]
+\]
+
+2) **Additive fusion**
+\[
+h_i = W_f h_i^{(f)} + W_b h_i^{(b)}
+\]
+
+3) **Learned gate**
+\[
+g_i=\sigma(W_g [h_i^{(f)};h_i^{(b)}]),\quad
+h_i = g_i\odot h_i^{(f)} + (1-g_i)\odot h_i^{(b)}
+\]
+
+Pretraining reuse:
+
+- Initialize forward stream with pretrained AR RWKV weights.
+- Initialize backward stream as a copy (approx) or train briefly on reversed sequences.
+
+Trade-offs: stronger denoising (full context) but higher complexity (two passes or doubled parameters) and non-trivial training stability.
+
+### Option C — Masked / Block-causal diffusion (recommended starting point)
+
+Use block structure of size \(B\). Inside each block: allow bidirectional information; across blocks: maintain left-to-right causality.
+
+Transformer analog: block-diagonal attention mask with causal block order.
+
+RWKV analog: process blocks with limited bidirectionality (e.g., within-block forward/backward pass or intra-block mixing), and pass only the left-to-right summary state across blocks. This offers a tunable trade-off: as \(B\) increases, denoising improves but cost rises.
+
+**Key hypothesis:** Block-causal diffusion can recover much of the quality of full bidirectional denoising while keeping compute near-linear and preserving much of AR pretraining structure.
+
+#### Sketch pseudocode (block-causal, two-pass within block)
+
+```python
+def denoise_block(x_block, t_emb, rwkv_f, rwkv_b, fuse):
+    h_f = rwkv_f.forward(x_block, t_emb)         # left->right inside block
+    h_b = rwkv_b.forward(reverse(x_block), t_emb) # right->left inside block
+    h_b = reverse(h_b)
+    return fuse(h_f, h_b)                         # concat/add/gated fusion
+```]]>
+        </Content>
+      </Section>
+      <Section id="2">
+        <Title>2. Timestep Injection / Conditioning</Title>
+        <Content>
+          <![CDATA[DiT commonly injects timestep (and label) through AdaLN-Zero: normalize then modulate via scale/shift predicted from \(t\) embedding.
+
+RWKV-v7 differs from Transformer: it uses TimeMix + ChannelMix and token shift operations. We propose **AdaLN-style conditioning at the LayerNorm inputs** of both TimeMix and ChannelMix, keeping core recurrence intact.
+
+### Conditioning module
+
+Let \(e_t\) be a timestep embedding (sinusoidal or learned). For each block \(l\), use an MLP to output:
+\[
+(\gamma_{\text{time}}^{(l)}(t),\beta_{\text{time}}^{(l)}(t),\gamma_{\text{ch}}^{(l)}(t),\beta_{\text{ch}}^{(l)}(t))
+\]
+
+AdaLN transform:
+\[
+\mathrm{AdaLN}(x;t)= (1+\gamma(t))\odot \mathrm{LN}(x)+\beta(t)
+\]
+
+Initialize MLP to output \(\gamma=\mathbf{0}\), \(\beta=\mathbf{0}\) (AdaLN-Zero), so conditioning starts as a no-op.
+
+### Modified RWKV block (high-level equations)
+
+For block \(l\):
+
+1) TimeMix path
+\[
+\tilde{x} = \mathrm{AdaLN}_{\text{time}}(x;t)
+\]
+\[
+y = \mathrm{TimeMix}(\tilde{x}, \text{state})
+\]
+\[
+x \leftarrow x + y
+\]
+
+2) ChannelMix path
+\[
+\tilde{x}' = \mathrm{AdaLN}_{\text{ch}}(x;t)
+\]
+\[
+y' = \mathrm{ChannelMix}(\tilde{x}')
+\]
+\[
+x \leftarrow x + y'
+\]
+
+Pseudo-code:
+
+```python
+def DiR_block(x, state, t_emb, MLP_cond, TimeMix, ChannelMix, LN):
+    gamma_t, beta_t, gamma_c, beta_c = MLP_cond(t_emb)
+    x1 = LN(x) * (1 + gamma_t) + beta_t
+    y, state = TimeMix(x1, state)
+    x = x + y
+    x2 = LN(x) * (1 + gamma_c) + beta_c
+    y2 = ChannelMix(x2)
+    x = x + y2
+    return x, state
+```
+
+**Why LN injection first?** It is minimally invasive, preserves pretrained linear projections and recurrence, and mirrors proven DiT conditioning design.]]>
+        </Content>
+      </Section>
+      <Section id="3">
+        <Title>3. Initialization from Pretrained AR RWKV-v7</Title>
+        <Content>
+          <![CDATA[Goal: reuse pretrained RWKV-v7 weights to accelerate convergence and preserve language competence.
+
+### Input representation shift: tokens → noisy latents / noisy embeddings
+
+Recommended baseline: diffuse in **embedding space** (dimension \(D\)):
+
+- Clean latent \(X_0 = E(\text{tokens}) \in \mathbb{R}^{N\times D}\)
+- Noised latent:
+\[
+X_t = \sqrt{\bar{\alpha}_t}X_0 + \sqrt{1-\bar{\alpha}_t}\,\epsilon,\quad \epsilon\sim \mathcal{N}(0,I)
+\]
+
+Then RWKV consumes \(X_t\) directly (same dimensionality as embeddings), allowing reuse of most of the network unchanged.
+
+If instead using a learned continuous latent (e.g., via an encoder), initialize the first projection to approximate identity into RWKV dimension \(D\).
+
+### Output head shift: next-token logits → noise / clean latent
+
+Two common parameterizations:
+
+1) **\(\epsilon\)-prediction**: model outputs \(\hat{\epsilon}\in\mathbb{R}^{N\times D}\)
+2) **\(x_0\)-prediction**: model outputs \(\hat{X}_0\in\mathbb{R}^{N\times D}\)
+
+Implementation choices:
+
+- Keep a linear head \(W_{\text{out}}: \mathbb{R}^D\to \mathbb{R}^D\), initialized as identity (or small init), to predict \(\epsilon\) or \(x_0\).
+- Optionally keep token logits head tied to embeddings \(E^\top\) for final discretization / auxiliary loss.
+
+### Handling distribution shift in intermediate layers
+
+Even with embedding diffusion, intermediate activations will see corrupted inputs, unlike AR pretraining. Recommended strategies:
+
+- **AdaLN-Zero conditioning** to stabilize early training.
+- **Noise curriculum**: start with lower noise levels and expand.
+- **Gradual unfreezing**: initially train conditioning + top layers, then unfreeze deeper layers.
+
+ControlNet-style side branch is generally less attractive for this use-case because the denoising task differs fundamentally from AR next-token prediction; a side branch would have to learn most of the transformation anyway. Baseline recommendation: **full fine-tuning** with careful stabilization tricks.]]>
+        </Content>
+      </Section>
+      <Section id="4">
+        <Title>4. Training Objective &amp; Loss</Title>
+        <Content>
+          <![CDATA[### Latent choice
+
+For text, discrete diffusion exists, but for DiR with pretrained RWKV, **continuous Gaussian diffusion in embedding space** is the most compatible starting point.
+
+### Loss (standard diffusion MSE)
+
+Let \(\epsilon_\theta(\cdot)\) be the denoiser (DiR). Optimize:
+\[
+\mathcal{L}(\theta)=\mathbb{E}_{X_0,t,\epsilon}\Big[\|\epsilon_\theta(X_t,t)-\epsilon\|_2^2\Big]
+\]
+
+Alternative:
+\[
+\mathcal{L}(\theta)=\mathbb{E}\Big[\|\hat{X}_0(X_t,t)-X_0\|_2^2\Big]
+\]
+with appropriate weighting.
+
+Optional auxiliary token alignment term (to prevent embedding drift):
+\[
+\mathcal{L}_{\text{tok}}=-\sum_{i}\log \mathrm{Softmax}(E^\top \hat{x}_{0,i})[w_i]
+\]
+Use small weight to avoid destabilizing diffusion training.
+
+### Sampling and decoding
+
+After iterative denoising to obtain \(\hat{X}_0\), discretize each position by nearest neighbor in embedding space:
+\[
+\hat{w}_i = \arg\max_{v\in \mathcal{V}} \langle E(v),\hat{x}_{0,i}\rangle
+\]]]>
+        </Content>
+      </Section>
+      <Section id="5">
+        <Title>FLOPs: Transformer vs RWKV in Diffusion</Title>
+        <Content>
+          <![CDATA[Let sequence length be \(N\), model width \(D\), layers \(L\), diffusion steps \(T\).
+
+- Transformer denoiser (full attention): per step \(O(L N^2 D)\) ⇒ total \(O(T L N^2 D)\)
+- RWKV denoiser: per step \(O(L N D)\) ⇒ total \(O(T L N D)\)
+
+Thus, asymptotically, DiR yields an \(O(N)\) vs \(O(N^2)\) advantage per diffusion step, which becomes decisive for long contexts.]]>
+        </Content>
+      </Section>
+      <Section id="6">
+        <Title>Biggest Potential Pitfalls</Title>
+        <Content>
+          <![CDATA[1) **Causality mismatch**: insufficient right-context can degrade denoising (Option A risk), while full Bi-RWKV adds complexity/stability risk (Option B).
+2) **Training instability under heavy noise**: pretrained dynamics may not tolerate early high-noise; needs curriculum, LR control, clipping.
+3) **Embedding manifold drift**: continuous outputs may not align to actual tokens; may need auxiliary token alignment or decoding regularization.
+4) **Quality vs step count**: diffusion needs multiple steps; speed gain may diminish if large \(T\) is needed for quality.
+5) **Long-range dependency retention**: RWKV’s decay / memory behavior may underperform full attention on some global consistency tasks; may require tuning decays or block size \(B\).]]>
+        </Content>
+      </Section>
+    </Sections>
+    <References>
+      <Ref key="DiT">Peebles, W. &amp; Xie, S. (2023). Diffusion Transformers (DiT).</Ref>
+      <Ref key="RWKV">RWKV papers/blogs by BlinkDL and community notes on TimeMix/ChannelMix &amp; token shift.</Ref>
+      <Ref key="CausalDiffusionLM">Work on causal / block diffusion language models; compare block-causal masks and sampling tradeoffs.</Ref>
+      <Ref key="MM-DiT-Repo">MM-LDLM / MM-DiT codebase (user provided repo link).</Ref>
+    </References>
+  </Document>
+</DiRReport>
